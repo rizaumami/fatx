@@ -41,6 +41,7 @@
 #
 # ------------------------------------------------------------------------------
 
+# Get current working directory.
 THIS_DIR=$(cd "$(dirname "$0")" || exit; pwd)
 cd "$THIS_DIR" || exit
 
@@ -92,7 +93,7 @@ fi
 
 OGXBOOTREC='ogxbootrec'
 # E, C, X, Y and Z partition's are hardcoded.
-declare -A XPART=( [0055f400]=E [00465400]=C [00000400]=X [00177400]=Y [002ee400]=Z )
+declare -A XPART=( [abe80000]=E [8ca80000]=C [00080000]=X [80000]=X [2ee80000]=Y [5dc80000]=Z )
 
 # FUNCTIONS --------------------------------------------------------------------
 
@@ -102,15 +103,12 @@ lsdisk(){
   lsblk -I 8 -do NAME,SIZE,MODEL
 }
 
-# Multiply hex value by 512
-truhex() {
-  printf '0x%x\n' $((0x$1 * 0x200))
-}
-
 # Mount FATX extended (not default) partitions
 mount_extpart() {
-  mapfile -t SECT < <(hexdump "$OGXBOOTREC" | awk '/0000 8000/{ print $5 $4" "$7 $6 }')
-  $FATX "$1" "$2" --offset="$(truhex "${SECT[$3]:0:8}")" --size="$(truhex "${SECT[$3]:(-8)}")"
+  mapfile -t SECT < <(hexdump "$OGXBOOTREC" | awk '/0000 8000/{ print "0x"$5 $4"*0x200 0x"$7 $6"*0x200" }')
+  LBAStart=$(printf '0x%x' "$((${SECT[$3]::16}))")
+  LBASize=$(printf '0x%x' "$((${SECT[$3]:(-16)}))")
+  $FATX "$1" "$2" --offset="${LBAStart}" --size="${LBASize}"
 }
 
 print_usage() {
@@ -123,7 +121,7 @@ print_usage() {
      or: ${0##*/} OPTION <device> <mountpoint> --drive=c|e|f|g|x|y|z
 
   OPTION:
-        lsblk   List connected disks.
+        lsblk   List block device (connected disks).
     -d  dump    Dump first sector of the Xbox disk (sector 0).
     -l  list    List Xbox disk's partitions from dump.
     -m  mount   Mount Xbox disk's partition.
@@ -149,7 +147,7 @@ case $1 in
   ;;
   -d|dump)
     if [[ "$#" -eq 1 ]]; then
-      warn 'Please define which disk sector to dump.'
+      warn 'Please define which disk to dump.'
       text "Example: sudo ${0##*/} dump /dev/sda"
       lsdisk
     else
@@ -165,21 +163,27 @@ case $1 in
       exit 0
     fi
 
-    # table header
-    printf ' %-10s %-14s %-14s %12s %10s\n\n' PARTITION 'OFFSET (hex)' 'SIZE (hex)' 'SIZE (dec)' 'SIZE (MB)'
+    # Table header
+    printf  '\e[01;32m %-10s %-14s %-14s %12s %10s\n\e[m\n' \
+            PARTITION \
+            'OFFSET (hex)' \
+            'SIZE (hex)' \
+            'SIZE (dec)' \
+            'SIZE (MB)'
 
     n=1
     while read -r PSTART PEND; do
-      # print table
-      printf  ' %-10s %-14s %-12s %14d %10d\n' \
-              "$n. ${XPART[$PSTART]}" \
-              "$(truhex "$PSTART")" \
-              "$(truhex "$PEND")" \
-              "$(truhex "$PEND")" \
-              "$(($(truhex "$PEND") / 0x100000))"
-      n=$((n+1))
-    # get active partision from boot sector dump
-    done < <(hexdump "$OGXBOOTREC" | awk '/0000 8000/{ print $5 $4" "$7 $6; }')
+      LBAStart=$(printf '%x' "$((PSTART))")
+      # Print table
+      printf  ' %-10s 0x%-12s 0x%-12x %12d %10d\n' \
+              "$n. ${XPART[$LBAStart]}" \
+              "$LBAStart" \
+              "$((PEND))" \
+              "$((PEND))" \
+              "$(((PEND) / 0x100000))"
+      ((n++))
+    # Get active partitions and multiply it by 512.
+    done < <(hexdump "$OGXBOOTREC" | awk '/0000 8000/{ print "0x"$5 $4"*0x200 0x"$7 $6"*0x200" }')
   ;;
   -m|mount)
     if [[ "$#" -eq 4 ]]; then
@@ -195,7 +199,7 @@ case $1 in
           mount_extpart "$2" "$3" 6
         ;;
         *)
-          $FATX "$2" "$3" "$4"
+          $FATX "${@:2}"
         ;;
       esac
     elif [[ "$#" -eq 3 ]]; then
