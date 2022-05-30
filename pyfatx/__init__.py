@@ -1,9 +1,15 @@
 #!/usr/bin/env python3
 import os
-from typing import Optional, Generator, Tuple, Sequence
+import platform
+import subprocess
+import logging
+from typing import AnyStr, Generator, Optional, Sequence, Tuple
 
 from .libfatx import ffi
 from .libfatx.lib import *
+
+
+log = logging.getLogger(__name__)
 
 
 class FatxAttr:
@@ -73,19 +79,21 @@ class Fatx:
 	def __del__(self):
 		if self.fs is not None:
 			fatx_close_device(self.fs)
+			# FIXME: Leaks fs
 
 	def _sanitize_path(self, path):
 		if isinstance(path, str):
 			path = path.encode('utf-8')
 		if not path.startswith(b'/'):
 			path = b'/' + path
+		path = path.replace(b'\\', b'/')
 		return path
 
 	def _create_attr(self, in_attr):
 		fname = ffi.string(in_attr.filename).decode('ascii')
 		return FatxAttr(fname, in_attr.attributes, in_attr.file_size)
 
-	def get_attr(self, path: str) -> FatxAttr:
+	def get_attr(self, path: AnyStr) -> FatxAttr:
 		"""
 		Get file attributes for a given path.
 		"""
@@ -140,6 +148,9 @@ class Fatx:
 		path = self._sanitize_path(path)
 		attr = self.get_attr(path)
 		assert(attr.is_file)
+		if offset == 0 and attr.file_size == 0:
+			return b''
+
 		assert(offset < attr.file_size)
 		if size is None:
 			size = attr.file_size - offset
@@ -149,3 +160,133 @@ class Fatx:
 		s = fatx_read(self.fs, path, offset, size, buf)
 		assert s == size
 		return ffi.buffer(buf)
+
+	def create_dirent(self, path: AnyStr, attributes: int = 0):
+		"""
+		Creates an empty file.
+		"""
+		dir_name = self._sanitize_path(os.path.dirname(path))
+		assert dir_name
+
+		d = ffi.new('struct fatx_dir *')
+		s = fatx_open_dir(self.fs, dir_name, d)
+		assert s == 0
+
+		path = self._sanitize_path(path)
+		s = fatx_create_dirent(self.fs, path, d, attributes)
+		if s:
+			fatx_close_dir(self.fs, d)
+			assert s == 0
+
+		s = fatx_close_dir(self.fs, d)
+		assert s == 0
+
+	def write(self, path: str, content: bytes, offset: int = 0, new_file_attributes: int = 0):
+		"""
+		Write to a file.
+		"""
+		path = self._sanitize_path(path)
+		try:
+			attr = self.get_attr(path)
+		except AssertionError:
+			self.create_dirent(path, new_file_attributes)
+			attr = self.get_attr(path)
+
+		if attr.is_file:
+			assert not attr.is_readonly
+		else:
+			assert not attr.is_directory
+
+		s = fatx_write(self.fs, path, offset, len(content), content)
+		assert s == len(content)
+
+	def rename(self, current_name: str, new_name: str, exchange=False, no_replace=False):
+		"""
+		Rename an existing file.
+
+		`current_name` must exist and be a file.
+		`new_name` must be a valid filename and must be in the same directory as
+		`current_name`.
+		"""
+		from_path = self._sanitize_path(current_name)
+		attr = self.get_attr(from_path)
+		# Only files are currently supported by libfatx.
+		assert attr.is_file
+
+		to_path = self._sanitize_path(new_name)
+		s = fatx_rename(self.fs, from_path, to_path, exchange, no_replace)
+		assert s == 0
+
+	def truncate(self, path: AnyStr, new_size: int):
+		"""
+		Truncate an existing file to the given size.
+		"""
+		path = self._sanitize_path(path)
+		attr = self.get_attr(path)
+		assert attr.is_file
+		s = fatx_truncate(self.fs, path, new_size)
+		assert s == 0
+
+	def mknod(self, path: AnyStr):
+		"""
+		Create a new file
+		"""
+		path = self._sanitize_path(path)
+		s = fatx_mknod(self.fs, path)
+		assert s == 0
+
+	def unlink(self, path: AnyStr):
+		"""
+		Delete an existing file.
+		"""
+		path = self._sanitize_path(path)
+		s = fatx_unlink(self.fs, path)
+		assert s == 0
+
+	def mkdir(self, path: AnyStr):
+		"""
+		Create a directory.
+		"""
+		path = self._sanitize_path(path)
+		s = fatx_mkdir(self.fs, path)
+		assert s == 0
+
+	def rmdir(self, path: AnyStr):
+		"""
+		Remove a directory.
+		"""
+		path = self._sanitize_path(path)
+		s = fatx_rmdir(self.fs, path)
+		assert s == 0
+
+	@classmethod
+	def format(cls, path:str):
+		"""
+		Format a device.
+		"""
+		log.info('Formatting...')
+		fs = pyfatx_open_helper()
+		s = fatx_disk_format(fs, path.encode('utf-8'), 512, 1, 128)
+		# FIXME: Leaks fs
+		assert s == 0
+
+	@classmethod
+	def create(cls, path:str, size:int = 8*1024*1024*1024):
+		"""
+		Create a disk image.
+		"""
+		if os.path.exists(path):
+			raise FileExistsError()
+
+		log.info('Creating empty disk image at %s...', path)
+		plat = platform.system()
+		if plat == 'Windows':
+			subprocess.run(['fsutil', 'file', 'createnew', path, str(size)], check=True)
+		elif plat == 'Linux':
+			subprocess.run(['fallocate', '-l', str(size), path])
+		elif plat == 'Darwin':
+			subprocess.run(['mkfile', '-n', str(size), path])
+		else:
+			assert False
+
+		Fatx.format(path)

@@ -110,36 +110,115 @@ cleanup:
     return retval;
 }
 
+int fatx_flush_fat_cache(struct fatx_fs *fs)
+{
+    struct fatx_cache *cache = &fs->fat_cache;
+
+    fatx_debug(fs, "fatx_flush_fat_cache()\n");
+
+    if (!cache->data || !cache->dirty)
+    {
+        return FATX_STATUS_SUCCESS;
+    }
+
+    if (fatx_dev_seek(fs, fs->fat_offset + cache->position * cache->entry_size))
+    {
+        fatx_error(fs, "failed to seek to fat cache start index %zd (offset 0x%zx)\n",
+                   cache->position, fs->fat_offset + cache->position * cache->entry_size);
+        return FATX_STATUS_ERROR;
+    }
+
+    if (fatx_dev_write(fs, cache->data, cache->entry_size, cache->entries) != cache->entries)
+    {
+        fatx_error(fs, "failed to write fatx cache entries to disk\n");
+        return FATX_STATUS_ERROR;
+    }
+
+    cache->dirty = false;
+    return FATX_STATUS_SUCCESS;
+}
+
+int fatx_populate_fat_cache(struct fatx_fs *fs, size_t index)
+{
+    int result;
+    struct fatx_cache *cache = &fs->fat_cache;
+
+    fatx_debug(fs, "fatx_populate_fat_cache(index=%zd)\n", index);
+
+    if (!fatx_cluster_valid(fs, index))
+    {
+        fatx_error(fs, "index number out of bounds\n");
+        return FATX_STATUS_ERROR;
+    }
+
+    if (fatx_flush_fat_cache(fs)) {
+        fatx_error(fs, "failed to flush fat cache\n");
+        return FATX_STATUS_ERROR;
+    }
+
+    if (cache->data)
+    {
+        free(cache->data);
+    }
+
+    cache->position   = index;
+    cache->entries    = MIN(FATX_FAT_CACHE_NUM_ENTRIES, fs->num_clusters + FATX_FAT_RESERVED_ENTRIES_COUNT - index);
+    cache->entry_size = fs->fat_type == FATX_FAT_TYPE_16 ? 2 : 4;
+
+    fatx_debug(fs, "populating fat cache: [pos: %zd, entries: %zd, entry_size: %zd]\n",
+               cache->position, cache->entries, cache->entry_size);
+
+    cache->data = malloc(cache->entries * cache->entry_size);
+
+    if (fatx_dev_seek(fs, fs->fat_offset + cache->position * cache->entry_size))
+    {
+        fatx_error(fs, "failed to seek to fat cache start index %zd (offset 0x%zx)\n",
+                   cache->position, fs->fat_offset + cache->position * cache->entry_size);
+        return FATX_STATUS_ERROR;
+    }
+
+    if (fatx_dev_read(fs, cache->data, cache->entry_size, cache->entries) != cache->entries)
+    {
+        fatx_error(fs, "failed to populate fat cache entries\n");
+        return FATX_STATUS_ERROR;
+    }
+
+    cache->dirty = false;
+    return FATX_STATUS_SUCCESS;
+}
+
 /*
  * Read from the FAT.
  */
 int fatx_read_fat(struct fatx_fs *fs, size_t index, fatx_fat_entry *entry)
 {
-    size_t fat_entry_offset, fat_entry_size;
+    struct fatx_cache *cache = &fs->fat_cache;
 
     fatx_debug(fs, "fatx_read_fat(index=%zd)\n", index);
 
     if (!fatx_cluster_valid(fs, index))
     {
         fatx_error(fs, "index number out of bounds\n");
-        return -1;
-    }
-
-    fat_entry_size   = fs->fat_type == FATX_FAT_TYPE_16 ? 2 : 4;
-    fat_entry_offset = fs->fat_offset + index * fat_entry_size;
-    *entry           = 0;
-
-    if (fatx_dev_seek(fs, fat_entry_offset))
-    {
-        fatx_error(fs, "failed to seek to index %zd in FAT (offset 0x%zx)\n",
-                   index, fat_entry_offset);
         return FATX_STATUS_ERROR;
     }
 
-    if (fatx_dev_read(fs, entry, fat_entry_size, 1) != 1)
+    if (!cache->data || index < cache->position || index >= cache->position + cache->entries)
     {
-        fatx_error(fs, "failed to read fat index %zd\n", index);
-        return FATX_STATUS_ERROR;
+        fatx_debug(fs, "fat cache miss for index %zd\n", index);
+        if (fatx_populate_fat_cache(fs, index))
+        {
+            fatx_error(fs, "failed to populate fat cache\n");
+            return FATX_STATUS_ERROR;
+        }
+    }
+
+    if (fs->fat_type == FATX_FAT_TYPE_16)
+    {
+        *entry = ((uint16_t*) cache->data)[index - cache->position];
+    }
+    else
+    {
+        *entry = ((uint32_t*) cache->data)[index - cache->position];
     }
 
     return FATX_STATUS_SUCCESS;
@@ -150,32 +229,36 @@ int fatx_read_fat(struct fatx_fs *fs, size_t index, fatx_fat_entry *entry)
  */
 int fatx_write_fat(struct fatx_fs *fs, size_t index, fatx_fat_entry entry)
 {
-    size_t fat_entry_offset, fat_entry_size;
+    struct fatx_cache *cache = &fs->fat_cache;
 
     fatx_debug(fs, "fatx_write_fat(index=%zd, entry=%zx)\n", index, entry);
 
     if (!fatx_cluster_valid(fs, index))
     {
         fatx_error(fs, "index number out of bounds\n");
-        return -1;
-    }
-
-    fat_entry_size   = fs->fat_type == FATX_FAT_TYPE_16 ? 2 : 4;
-    fat_entry_offset = fs->fat_offset + index * fat_entry_size;
-
-    if (fatx_dev_seek(fs, fat_entry_offset))
-    {
-        fatx_error(fs, "failed to seek to index %zd in FAT (offset 0x%zx)\n",
-                   index, fat_entry_offset);
         return FATX_STATUS_ERROR;
     }
 
-    if (fatx_dev_write(fs, &entry, fat_entry_size, 1) != 1)
+    if (!cache->data || index < cache->position || index >= cache->position + cache->entries)
     {
-        fatx_error(fs, "failed to write fat index %zd\n", index);
-        return FATX_STATUS_ERROR;
+        fatx_debug(fs, "fat cache miss for index %zd\n", index);
+        if (fatx_populate_fat_cache(fs, index))
+        {
+            fatx_error(fs, "failed to populate fat cache\n");
+            return FATX_STATUS_ERROR;
+        }
     }
 
+    if (fs->fat_type == FATX_FAT_TYPE_16)
+    {
+        ((uint16_t*) cache->data)[index - cache->position] = entry;
+    }
+    else
+    {
+        ((uint32_t*) cache->data)[index - cache->position] = entry;
+    }
+
+    cache->dirty = true;
     return FATX_STATUS_SUCCESS;
 }
 
@@ -231,6 +314,13 @@ int fatx_cluster_number_to_byte_offset(struct fatx_fs *fs, size_t cluster, uint6
 
     *offset = fs->cluster_offset
               + (cluster - FATX_FAT_RESERVED_ENTRIES_COUNT) * fs->bytes_per_cluster;
+
+    if (*offset >= fs->partition_offset + fs->partition_size)
+    {
+        fatx_error(fs, "Cluster %d has overrun partition limit !!!\n", cluster);
+        fatx_error(fs, "Bailing to avoid corruption");
+        return FATX_STATUS_ERROR;
+    }
 
     return FATX_STATUS_SUCCESS;
 }
@@ -322,16 +412,35 @@ int fatx_free_cluster_chain(struct fatx_fs *fs, size_t first_cluster)
 /*
  * Find an available cluster.
  */
-int fatx_alloc_cluster(struct fatx_fs *fs, size_t *cluster)
+int fatx_alloc_cluster(struct fatx_fs *fs, size_t *cluster, bool zero)
 {
     int status;
     fatx_fat_entry fat_entry;
-    size_t i;
+    static size_t i = 2;
+    size_t start_i;
+    bool wrapped;
+    void *zero_buf;
 
-    fatx_debug(fs, "fatx_alloc_cluster()\n");
+    fatx_debug(fs, "fatx_alloc_cluster(zero: %s)\n", zero ? "true" : "false");
 
-    for (i=2; 1; i++)
+    start_i = i;
+    wrapped = false;
+
+    for (; 1; i++)
     {
+        if (i >= fs->num_clusters)
+        {
+            i = 2;
+            wrapped = true;
+        }
+
+        /* Check for the case that the FAT was full when mounting initially */
+        if (i == start_i && wrapped)
+        {
+            fatx_error(fs, "no clusters available to allocate\n");
+            return FATX_STATUS_ERROR;
+        }
+
         status = fatx_read_fat(fs, i, &fat_entry);
         if (status != FATX_STATUS_SUCCESS)
         {
@@ -349,6 +458,19 @@ int fatx_alloc_cluster(struct fatx_fs *fs, size_t *cluster)
 
     status = fatx_mark_cluster_end(fs, i);
     if (status != FATX_STATUS_SUCCESS) return status;
+
+    status = fatx_dev_seek_cluster(fs, i, 0);
+    if (status != FATX_STATUS_SUCCESS) return status;
+
+    if (zero)
+    {
+        zero_buf = calloc(1, fs->bytes_per_cluster);
+        if (!zero_buf) return FATX_STATUS_ERROR;
+
+        status = fatx_dev_write(fs, zero_buf, fs->bytes_per_cluster, 1);
+        free(zero_buf);
+        if (status != 1) return status;
+    }
 
     *cluster = i;
 

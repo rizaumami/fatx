@@ -62,7 +62,7 @@ int fatx_find_cluster_for_file_offset_alloc(struct fatx_fs *fs, struct fatx_attr
         {
             fatx_debug(fs, "out of clusters, allocating new one\n");
 
-            status = fatx_alloc_cluster(fs, &alloc_cluster);
+            status = fatx_alloc_cluster(fs, &alloc_cluster, true);
             if (status) return status;
 
             status = fatx_attach_cluster(fs, cluster, alloc_cluster);
@@ -243,11 +243,7 @@ int fatx_write(struct fatx_fs *fs, char const *path, off_t offset, size_t size, 
         size_t bytes_written;
 
         /* Careful not to overflow */
-        bytes_to_write = size - total_bytes_written;
-        if(fs->bytes_per_cluster >= cluster_offset)
-        {
-            bytes_to_write = MIN(fs->bytes_per_cluster - cluster_offset, bytes_to_write);   
-        }
+        bytes_to_write = MIN(fs->bytes_per_cluster - cluster_offset, size - total_bytes_written);
 
         /* Write to the current cluster if we have space. */
         if (bytes_to_write > 0)
@@ -280,12 +276,15 @@ int fatx_write(struct fatx_fs *fs, char const *path, off_t offset, size_t size, 
             {
                 fatx_debug(fs, "EOF, allocating new cluster\n");
 
+                /* If we're going to write to the entire cluster, there's no need to zero it */
                 size_t new_cluster;
-                status = fatx_alloc_cluster(fs, &new_cluster);
+                status = fatx_alloc_cluster(fs, &new_cluster, size - total_bytes_written < fs->bytes_per_cluster);
                 if (status) return status;
 
                 status = fatx_attach_cluster(fs, cluster, new_cluster);
                 if (status) return status;
+
+                cluster = new_cluster;
             }
 
             status = fatx_dev_seek_cluster(fs, cluster, 0);
@@ -365,7 +364,7 @@ int fatx_truncate(struct fatx_fs *fs, char const *path, off_t offset)
         {
             /* Out of clusters, alloc more */
             size_t new_cluster;
-            status = fatx_alloc_cluster(fs, &new_cluster);
+            status = fatx_alloc_cluster(fs, &new_cluster, true);
             if (status) return status;
 
             status = fatx_attach_cluster(fs, cluster, new_cluster);
@@ -406,44 +405,107 @@ int fatx_truncate(struct fatx_fs *fs, char const *path, off_t offset)
 /*
  * Rename a file
  */
-int fatx_rename(struct fatx_fs *fs, char const *from, char const *to)
+int fatx_rename(struct fatx_fs *fs, char const *from, char const *to, bool exchange, bool no_replace)
 {
     fatx_debug(fs, "fatx_rename(from=\"%s\", to=\"%s\")\n", from, to);
 
-    struct fatx_attr attr;
-    char *from_dirname, *to_dirname;
-    char *to_basename;
+    struct fatx_attr attr_from, attr_to;
+    char *from_dirname = 0, *to_dirname = 0;
+    char *from_basename = 0, *to_basename = 0;
     int path_dif, status;
+
+    if (exchange && no_replace)
+    {
+        fatx_error(fs, "exchange and no_replace both set\n");
+        return FATX_STATUS_ERROR;
+    }
 
     /* Sanity check that we're not trying to move the file */
     from_dirname = fatx_dirname(from);
     to_dirname = fatx_dirname(to);
     path_dif = strcmp(from_dirname, to_dirname);
-    free(from_dirname);
-    free(to_dirname);
-    if (path_dif)
-    {
-        fatx_error(fs, "rename directories do not match\n");
-        return FATX_STATUS_ERROR;
-    }
-
-    /* Get file attributes. */
-    status = fatx_get_attr(fs, from, &attr);
-    if (status) return status;
 
     /* Check that the new filename is not too long */
     to_basename = fatx_basename(to);
     if (strlen(to_basename) >= FATX_MAX_FILENAME_LEN)
     {
-        free(to_basename);
         fatx_error(fs, "destination name too long\n");
-        return FATX_STATUS_ERROR;
+        status = FATX_STATUS_ERROR;
+        goto done;
     }
 
-    /* Rename the file */
-    strcpy(attr.filename, to_basename);
-    free(to_basename);
+    from_basename = fatx_basename(from);
+    if (strlen(from_basename) >= FATX_MAX_FILENAME_LEN)
+    {
+        fatx_error(fs, "source name too long\n");
+        status = FATX_STATUS_ERROR;
+        goto done;
+    }
 
-    /* Save new attributes */
-    return fatx_set_attr(fs, from, &attr);
+    /* Get source file attributes. */
+    status = fatx_get_attr(fs, from, &attr_from);
+    if (status) goto done;
+
+    /* Get destination file attributes */
+    status = fatx_get_attr(fs, to, &attr_to);
+    if (status == FATX_STATUS_FILE_NOT_FOUND)
+    {
+        /* no_replace does not apply */
+        if (exchange)
+        {
+            fatx_error(fs, "destination does not exist but exchange was set\n");
+            status = FATX_STATUS_ERROR;
+        }
+        else if (path_dif)
+        {
+            status = fatx_mknod(fs, to);
+            if (status) goto done;
+            status = fatx_attr_atomic_swap(fs, from_dirname, from_basename, to_dirname, to_basename);
+            if (status) goto done;
+            status = fatx_unlink(fs, from);
+        }
+        else
+        {
+            /* No file in destination, so rename the first */
+            strcpy(attr_from.filename, to_basename);
+            status = fatx_set_attr(fs, from, &attr_from);
+        }
+    }
+    else if (status == FATX_STATUS_SUCCESS)
+    {
+        if (no_replace)
+        {
+            fatx_error(fs, "destination name already exists and no_replace was set\n");
+            status = FATX_STATUS_ERROR;
+        }
+        else if (exchange)
+        {
+            status = fatx_attr_atomic_swap(fs, from_dirname, from_basename, to_dirname, to_basename);
+        }
+        else if (path_dif)
+        {
+            status = fatx_attr_atomic_swap(fs, from_dirname, from_basename, to_dirname, to_basename);
+            if (status) goto done;
+            status = fatx_unlink(fs, from);
+        }
+        else
+        {
+            /* Replace the file at the destination */
+            status = fatx_unlink(fs, to);
+            if (status) goto done;
+            strcpy(attr_from.filename, to_basename);
+            status = fatx_set_attr(fs, from, &attr_from);
+        }
+    }
+    else
+    {
+        fatx_error(fs, "error getting destination attributes");
+    }
+
+done:
+    free(from_dirname);
+    free(to_dirname);
+    if (to_basename) free(to_basename);
+    if (from_basename) free(from_basename);
+    return status;
 }

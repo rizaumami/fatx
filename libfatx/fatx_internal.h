@@ -146,6 +146,7 @@ size_t fatx_dev_write(struct fatx_fs *fs, const void *buf, size_t size, size_t i
 /* FAT Functions */
 int fatx_init_fat(struct fatx_fs *fs);
 int fatx_init_root(struct fatx_fs *fs);
+int fatx_flush_fat_cache(struct fatx_fs *fs);
 int fatx_read_fat(struct fatx_fs *fs, size_t index, fatx_fat_entry *entry);
 int fatx_write_fat(struct fatx_fs *fs, size_t index, fatx_fat_entry entry);
 int fatx_cluster_number_to_byte_offset(struct fatx_fs *fs, size_t cluster, uint64_t *offset);
@@ -154,7 +155,7 @@ int fatx_get_next_cluster(struct fatx_fs *fs, size_t *cluster);
 int fatx_mark_cluster_available(struct fatx_fs *fs, size_t cluster);
 int fatx_mark_cluster_end(struct fatx_fs *fs, size_t cluster);
 int fatx_free_cluster_chain(struct fatx_fs *fs, size_t first_cluster);
-int fatx_alloc_cluster(struct fatx_fs *fs, size_t *cluster);
+int fatx_alloc_cluster(struct fatx_fs *fs, size_t *cluster, bool zero);
 int fatx_attach_cluster(struct fatx_fs *fs, size_t tail, size_t cluster);
 
 /* Directory Functions */
@@ -169,7 +170,5 @@ int fatx_unpack_date(uint16_t in, struct fatx_ts *out);
 int fatx_unpack_time(uint16_t in, struct fatx_ts *out);
 int fatx_pack_date(struct fatx_ts *in, uint16_t *out);
 int fatx_pack_time(struct fatx_ts *in, uint16_t *out);
-char *fatx_dirname(const char *path);
-char *fatx_basename(const char *path);
 
 #endif
