@@ -1,0 +1,230 @@
+#!/usr/bin/env bash
+set -euo pipefail
+#IFS=$'\n\t'
+
+# fatx-cli is a Bash script wrapper for fatx (fatxfs), a userspace FATX
+# filesystem driver (https://github.com/mborgerson/fatx).
+#
+# fatx-cli written primarily because fatx doesn't automagically mount F and G
+# partitions (https://github.com/mborgerson/fatx/issues/30) yet.
+#
+# This script uses alot of bashism. Please use latest version of Bash.
+#
+# Sahri Riza Umami
+#   v0.1  - 2022/02/13 18:51:36
+#         - Initial release.
+#   v0.2  - 2023/12/10 23:30:48
+#         - Better script.
+#
+# LICENSE ----------------------------------------------------------------------
+#
+# This is free and unencumbered software released into the public domain.
+#
+# Anyone is free to copy, modify, publish, use, compile, sell, or
+# distribute this software, either in source code form or as a compiled
+# binary, for any purpose, commercial or non-commercial, and by any
+# means.
+#
+# In jurisdictions that recognize copyright laws, the author or authors
+# of this software dedicate any and all copyright interest in the
+# software to the public domain. We make this dedication for the benefit
+# of the public at large and to the detriment of our heirs and
+# successors. We intend this dedication to be an overt act of
+# relinquishment in perpetuity of all present and future rights to this
+# software under copyright law.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+# EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+# MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
+# IN NO EVENT SHALL THE AUTHORS BE LIABLE FOR ANY CLAIM, DAMAGES OR
+# OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE,
+# ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
+# OTHER DEALINGS IN THE SOFTWARE.
+#
+# For more information, please refer to <http://unlicense.org>
+#
+# ------------------------------------------------------------------------------
+
+print() { printf '%s\n' "$@" ;}
+# Print green print,
+print_g() { printf '\e[32m%s\n\e[m' "$@" ;}
+# Print brown print.
+print_w() { printf '\e[33m%s\n\e[m' "$@" ;}
+
+# Checking dependencies:
+declare -a DEPS=( awk fatxfs od )
+for (( NUM=${#DEPS[@]}, i=0; i<NUM; i++ )); do
+  if command -v "${DEPS[i]}" &>/dev/null ; then
+    unset -v 'DEPS[i]'
+  fi
+done
+if [[ "${#DEPS[@]}" -gt 0 ]]; then
+  print_w    'Package(s) not found'
+  print_w    'Install the proper distribution package for your system:'
+  printf  '   - %s\n' "${DEPS[@]}"
+  exit 1
+fi
+
+# VARIABLES --------------------------------------------------------------------
+
+PARTINFO='/tmp/ogxptbl'
+#  Default partitions offset.
+#  PARTITION     OFFSET      LETTER
+#  Partition 1   abe80000    E
+#  Partition 2   8ca80000    C
+#  Partition 3   00080000    X
+#  Partition 3   80000       X
+#  Partition 4   2ee80000    Y
+#  Partition 5   5dc80000    Z
+declare -A XPART=( [1]="E" [2]="C" [3]="X" [4]="Y" [5]="Z" [6]="F" [7]="G" [e]="0" [c]="1" [x]="2" [y]="3" [z]="4" [f]="5" [g]="6" )
+
+# FUNCTIONS --------------------------------------------------------------------
+
+dump_part_info() {
+  PARTINFO="$(lsblk -dno MODEL "$1")"
+  PARTINFO="/tmp/ogxpartinfo-${PARTINFO// /_}"
+  sudo dd if="$1" of="$PARTINFO" bs=512 count=1 status=none
+  print_g "$1 partition info has been dumped to ${PARTINFO}."
+}
+
+lsdisk(){
+  local DISKS LSDISKS
+  mapfile -t DISKS < <(lsblk -dno NAME)
+  for (( NUM=${#DISKS[@]}, i=0; i<NUM; i++ )); do
+    # Do not list mounted disks.
+    if grep "${DISKS[i]}" /etc/mtab &>/dev/null ; then
+      unset -v 'DISKS[i]'
+    fi
+  done
+  # Pretty print.
+  mapfile -t LSDISKS < <(lsblk -dno PATH,SIZE,MODEL "$(printf '/dev/%s' "${DISKS[@]// /}")")
+  print_w "Check your Xbox's disk in the list below:"
+  for i in "${!LSDISKS[@]}"; do
+    print "$((i+1)). ${LSDISKS[i]}"
+  done
+}
+
+mount_partition() {
+  local LBASize LBAStart SECTOR
+  dump_part_info "$1" &>/dev/null
+  mapfile -t SECTOR < <(od -t x4 "$PARTINFO" | awk '/80000000/{ print "0x"$3"*0x200 0x"$4"*0x200" }')
+  if [[ $3 -ge ${#SECTOR[@]} ]]; then
+    print_w "$1 does not have ${XPART[$3]} partition."
+    exit
+  fi
+  LBAStart=$(printf '0x%x' "$((${SECTOR[$3]::16}))")
+  LBASize=$(printf '0x%x' "$((${SECTOR[$3]:(-16)}))")
+  sudo fatxfs -o allow_other "$1" "$2" --offset="${LBAStart}" --size="${LBASize}"
+}
+
+print_usage() {
+  printf '%s\n' "
+  ${0##*/} is a wrapper script for fatxfs, a userspace FATX filesystem driver.
+
+  Usage: ${0##*/} OPTION
+  Usage: ${0##*/} OPTION <device>
+     or: ${0##*/} OPTION <device> <mountpoint> --drive=c|e|f|g|x|y|z
+
+  OPTION:
+        lsblk   List unmounted block device (connected disks).
+    -d  dump    Dump partition info of the Xbox disk (sector 0).
+    -l  list    List Xbox disk's partitions.
+    -m  mount   Mount Xbox disk's partition.
+
+  Example:
+    - List connected but unmounted block devices.
+      ${0##*/} lsblk
+
+    - Dump partition info of /dev/sdc.
+      ${0##*/} dump /dev/sdc
+
+    - List partitions of /dev/sda.
+      ${0##*/} list /dev/sda
+
+    - Mount F partition of /dev/sdc to ${HOME}/ogxhdd.
+      ${0##*/} mount /dev/sdc ${HOME}/ogxhdd --drive=f
+"
+  exit
+}
+
+# MAIN -------------------------------------------------------------------------
+
+# Only accept 1 to 4 arguments.
+[[ $# -eq 0 ]] || [[ $# -gt 4 ]] && print_usage
+
+case $1 in
+  lsblk)
+    lsdisk
+  ;;
+  -d|dump)
+    if [[ $# -eq 1 ]]; then
+      print_w 'Please define which disk to dump.'
+      print "Example: ${0##*/} dump /dev/sda" ''
+      lsdisk
+      exit
+    else
+      dump_part_info "$2"
+    fi
+  ;;
+  -l|list)
+    if [[ $# -lt 2 ]]; then
+      print_w "List option need an argument."
+      print "Example: ${0##*/} list /dev/sda"
+      exit
+    fi
+
+    dump_part_info "$2" &>/dev/null
+
+    # Print table header.
+    printf  "\e[01;32m %-10s %-14s %-14s %12s %10s\n\e[m" \
+            PARTITION \
+            'OFFSET (hex)' \
+            'SIZE (hex)' \
+            'SIZE (dec)' \
+            'SIZE (MB)'
+
+    n=1
+    while read -r PSTART PEND; do
+      LBAStart=$(printf '%x' "$((PSTART))")
+      # Print table content.
+      printf  " %-10s 0x%-12s 0x%-12x %12d %10d\n" \
+              "$n. ${XPART[$n]}" \
+              "$LBAStart" \
+              "$((PEND))" \
+              "$((PEND))" \
+              "$(((PEND) / 0x100000))"
+      ((n++))
+    # Get active partitions and multiply it by 512.
+    done < <(od -t x4 "$PARTINFO" | awk '/80000000/{ print "0x"$3"*0x200 0x"$4"*0x200" }')
+  ;;
+  -m|mount)
+    if [[ "$#" -eq 4 ]]; then
+      if [[ ! -d $3 ]]; then
+        print_w "${3}: No such directory."
+        exit
+      fi
+      # Slice the drive letter string.
+      DRVLTR=${4:(-1)}
+      # And make it lowercase.
+      case ${DRVLTR,,} in
+        c|e|f|g|x|y|z)
+          mount_partition "$2" "$3" "${XPART[$DRVLTR]}"
+        ;;
+        *)
+          print_w 'Mount option only accept C, E, F, G, X, Y and Z drive.'
+          exit
+        ;;
+      esac
+    elif [[ "$#" -eq 3 ]]; then
+      # Mount C if no drive letter specified (default behaviour).
+      sudo fatxfs -o allow_other "${@:2}"
+    elif [[ "$#" -lt 3 ]]; then
+      print_w "Mount option need arguments."
+      print "Example: ${0##*/} mount /dev/sda /mnt/point --drive=f"
+      exit
+    fi
+  ;;
+  *)
+    print_usage
+  ;;
+esac
