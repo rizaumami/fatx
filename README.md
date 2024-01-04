@@ -32,14 +32,14 @@ fatxfs can be easily built inside a [Docker](https://www.docker.com/) container.
 ##### Ubuntu
 Assuming you already have typical build tools installed, install FUSE and CMake:
 
-    $ sudo apt-get install libfuse-dev cmake
+    $ sudo apt-get install libfuse-dev cmake pkg-config
 
 ##### macOS
 Download Xcode (available from the App Store) to get command line tools.
 
 Assuming you have homebrew installed, install `pkgconfig` and `cmake`:
 
-    $ brew install install pkgconfig cmake macfuse
+    $ brew install pkgconfig cmake macfuse
 
 #### Download Source
 Clone the repository:
@@ -81,7 +81,7 @@ If your disk image is a [qcow](https://en.wikipedia.org/wiki/Qcow) image, you ca
     $ sudo qemu-nbd --connect=/dev/nbd0 /path/to/your/image.qcow2
     $ sudo chmod a+rwx /dev/nbd0
 
-Unfortunately, on OS X, there is not a way to mount a qcow image like this (AFAIK). I recommend converting the qcow image to a raw disk image.
+Unfortunately, on macOS, there is not a way to mount a qcow image like this (AFAIK). I recommend converting the qcow image to a raw disk image.
 
     $ qemu-img convert /path/to/image.qcow /path/to/output.raw
 
