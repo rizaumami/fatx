@@ -10,12 +10,6 @@ set -euo pipefail
 #
 # This script uses alot of bashism. Please use latest version of Bash.
 #
-# Sahri Riza Umami
-#   v0.1  - 2022/02/13 18:51:36
-#         - Initial release.
-#   v0.2  - 2023/12/10 23:30:48
-#         - Better script.
-#
 # LICENSE ----------------------------------------------------------------------
 #
 # This is free and unencumbered software released into the public domain.
@@ -45,11 +39,11 @@ set -euo pipefail
 #
 # ------------------------------------------------------------------------------
 
-print() { printf '%s\n' "$@" ;}
+print() { printf ':: %s\n' "$@" ;}
 # Print green print,
-print_g() { printf '\e[32m%s\n\e[m' "$@" ;}
+print_g() { printf '\e[32m:: %s\n\e[m' "$@" ;}
 # Print brown print.
-print_w() { printf '\e[33m%s\n\e[m' "$@" ;}
+print_w() { printf '\e[33m:: %s\n\e[m' "$@" ;}
 
 # Checking dependencies:
 declare -a DEPS=( awk fatxfs od )
@@ -68,52 +62,89 @@ fi
 # VARIABLES --------------------------------------------------------------------
 
 PARTINFO='/tmp/ogxptbl'
-#  Default partitions offset.
-#  PARTITION     OFFSET      LETTER
-#  Partition 1   abe80000    E
-#  Partition 2   8ca80000    C
-#  Partition 3   00080000    X
-#  Partition 3   80000       X
-#  Partition 4   2ee80000    Y
-#  Partition 5   5dc80000    Z
-declare -A XPART=( [1]="E" [2]="C" [3]="X" [4]="Y" [5]="Z" [6]="F" [7]="G" [e]="0" [c]="1" [x]="2" [y]="3" [z]="4" [f]="5" [g]="6" )
+# Default partitions offset.
+# PARTITION  OFFSET (hex)   SIZE (hex)       SIZE (dec)  SIZE (MB)
+# 1. E       0xabe80000     0x1312d6000      5120024576       4882
+# 2. C       0x8ca80000     0x1f400000        524288000        500
+# 3. X       0x80000        0x2ee00000        786432000        750
+# 4. Y       0x2ee80000     0x2ee00000        786432000        750
+# 5. Z       0x5dc80000     0x2ee00000        786432000        750
+declare -a RETAIL=(
+'0x0055f400*0x200 0x009896b0*0x200'
+'0x00465400*0x200 0x000fa000*0x200'
+'0x00000400*0x200 0x00177000*0x200'
+'0x00177400*0x200 0x00177000*0x200'
+'0x002ee400*0x200 0x00177000*0x200'
+)
+
+declare -A XPART=( [0]="E" [1]="C" [2]="X" [3]="Y" [4]="Z" [5]="F" [6]="G" [e]="0" [c]="1" [x]="2" [y]="3" [z]="4" [f]="5" [g]="6" )
 
 # FUNCTIONS --------------------------------------------------------------------
 
-dump_part_info() {
-  PARTINFO="$(lsblk -dno MODEL "$1")"
-  PARTINFO="/tmp/ogxpartinfo-${PARTINFO// /_}"
-  sudo dd if="$1" of="$PARTINFO" bs=512 count=1 status=none
-  print_g "$1 partition info has been dumped to ${PARTINFO}."
+reconnect_qcow(){
+  # This is dirty. I don't know how to mount multi partition of qcow2.
+  # So we forced probe > unmount > disconnect > reconnect.
+  sudo modprobe nbd max_part=8 &>/dev/null
+  if grep "${1##*/}" /etc/mtab &>/dev/null; then
+    MNTQCOW=$(grep -oP '(?<=fatxfs ).*?(?= fuse.fatxfs)' /etc/mtab | grep "${1##*/}")
+    sudo umount -l "$MNTQCOW"
+  fi
+  sudo qemu-nbd --disconnect /dev/nbd0 &>/dev/null
+  sudo qemu-nbd --connect=/dev/nbd0 "$1"
+  DISK='/dev/nbd0'
 }
 
-lsdisk(){
-  local DISKS LSDISKS
-  mapfile -t DISKS < <(lsblk -dno NAME)
-  for (( NUM=${#DISKS[@]}, i=0; i<NUM; i++ )); do
-    # Do not list mounted disks.
-    if grep "${DISKS[i]}" /etc/mtab &>/dev/null ; then
-      unset -v 'DISKS[i]'
-    fi
-  done
-  # Pretty print.
-  mapfile -t LSDISKS < <(lsblk -dno PATH,SIZE,MODEL "$(printf '/dev/%s' "${DISKS[@]// /}")")
-  print_w "Check your Xbox's disk in the list below:"
-  for i in "${!LSDISKS[@]}"; do
-    print "$((i+1)). ${LSDISKS[i]}"
-  done
+dump_part_info() {
+  DISK="$1"
+
+  if [[ ${DISK##*.} == 'qcow2' ]]; then
+    reconnect_qcow "$1"
+  fi
+
+  if lsblk -dno MODEL "$DISK" &>/dev/null; then
+    MODEL="$(lsblk -dno MODEL "$DISK")"
+  fi
+
+  if [[ -z ${MODEL:-} ]]; then
+    MODEL="${DISK##*/}"
+  fi
+
+  PARTINFO="${PARTINFO}-${MODEL// /_}"
+  if [[ $(stat -c '%U' "$DISK") == "$USER" ]]; then
+    dd if="$DISK" of="$PARTINFO" bs=512 count=1 status=none
+  else
+    sudo dd if="$DISK" of="$PARTINFO" bs=512 count=1 status=none
+  fi
+
+  if [[ ${DISK##*.} == 'qcow2' ]]; then
+    sudo qemu-nbd --disconnect /dev/nbd0 &>/dev/null
+  fi
+
+  # Get active partitions and multiply it by 512.
+  mapfile -t SECTOR < <(od -t x4 "$PARTINFO" | awk '/80000000/{ print "0x"$3"*0x200 0x"$4"*0x200" }')
+
+  print_g "$DISK partition info has been dumped to ${PARTINFO}"
 }
 
 mount_partition() {
   local LBASize LBAStart SECTOR
+
   dump_part_info "$1" &>/dev/null
-  mapfile -t SECTOR < <(od -t x4 "$PARTINFO" | awk '/80000000/{ print "0x"$3"*0x200 0x"$4"*0x200" }')
+
+  if [[ ${#SECTOR[@]} -eq 0 ]]; then
+    print_w "$1 doesn't have partition table"
+    print "> Trying retail offset and size"
+    SECTOR=( "${RETAIL[@]}" )
+  fi
+
   if [[ $3 -ge ${#SECTOR[@]} ]]; then
-    print_w "$1 does not have ${XPART[$3]} partition."
+    print_w "$1 does not have ${XPART[$3]} partition"
     exit
   fi
+
   LBAStart=$(printf '0x%x' "$((${SECTOR[$3]::16}))")
   LBASize=$(printf '0x%x' "$((${SECTOR[$3]:(-16)}))")
+
   sudo fatxfs -o allow_other "$1" "$2" --offset="${LBAStart}" --size="${LBASize}"
 }
 
@@ -121,59 +152,102 @@ print_usage() {
   printf '%s\n' "
   ${0##*/} is a wrapper script for fatxfs, a userspace FATX filesystem driver.
 
-  Usage: ${0##*/} OPTION
-  Usage: ${0##*/} OPTION <device>
-     or: ${0##*/} OPTION <device> <mountpoint> --drive=c|e|f|g|x|y|z
+  Usage: ${0##*/} -t TASK OPTIONS
 
-  OPTION:
-        lsblk   List unmounted block device (connected disks).
-    -d  dump    Dump partition info of the Xbox disk (sector 0).
-    -l  list    List Xbox disk's partitions.
-    -m  mount   Mount Xbox disk's partition.
+  TASK:
+    lsblk   List unmounted block device (connected disks).
+    dump    Dump partition info of the Xbox disk (sector 0).
+    list    List Xbox disk's partitions.
+    mount   Mount Xbox disk's partition.
+
+  OPTIONS:
+    -d      Partitions's drive letter.
+    -h      Print this text and exit.
+    -i      Device to mount.
+    -o      Mountpoint.
+    -v      Script's version.
 
   Example:
     - List connected but unmounted block devices.
-      ${0##*/} lsblk
+      ${0##*/} -t lsblk
 
     - Dump partition info of /dev/sdc.
-      ${0##*/} dump /dev/sdc
+      ${0##*/} -t dump -i /dev/sdc
 
     - List partitions of /dev/sda.
-      ${0##*/} list /dev/sda
+      ${0##*/} -t list -i /dev/sda
 
     - Mount F partition of /dev/sdc to ${HOME}/ogxhdd.
-      ${0##*/} mount /dev/sdc ${HOME}/ogxhdd --drive=f
+      ${0##*/} -t mount -o /dev/sdc -o ${HOME}/ogxhdd -d F
 "
   exit
 }
-
 # MAIN -------------------------------------------------------------------------
 
-# Only accept 1 to 4 arguments.
-[[ $# -eq 0 ]] || [[ $# -gt 4 ]] && print_usage
+# Cleanup after an unexpected event.
+#trap 'rm -r "$TMPDIR"; exit' SIGINT ERR
 
-case $1 in
+# If this script run without argument.
+[[ ${#@} -eq 0 ]] && print_usage
+
+while getopts ":d:hi:o:t:v" opt; do
+  case $opt in
+    d)
+      DRV="${OPTARG,,}"
+    ;;
+    h)
+      print_usage
+    ;;
+    i)
+      DISK="$OPTARG"
+    ;;
+    o)
+      MNT="$OPTARG"
+    ;;
+    t)
+      TASK="$OPTARG"
+    ;;
+    v)
+      echo ':: fatx-cli v0.3 (2024.01.04) - written by si_kabayan'
+      exit
+    ;;
+    \?)
+      print_w "Wrong option: -$OPTARG" >&2
+      exit 1
+    ;;
+    :)
+      print_w "Option -$OPTARG need an argument" >&2
+      exit 1
+    ;;
+  esac
+done
+
+case "$TASK" in
   lsblk)
-    lsdisk
+    lsblk -Ado PATH,SIZE,MODEL
   ;;
-  -d|dump)
-    if [[ $# -eq 1 ]]; then
-      print_w 'Please define which disk to dump.'
-      print "Example: ${0##*/} dump /dev/sda" ''
-      lsdisk
+  dump)
+    if [[ -z ${DISK:-} ]]; then
+      print_w 'Please define which disk to dump'
+      print "Example: ${0##*/} -t dump -i /dev/sda"
       exit
     else
-      dump_part_info "$2"
+      dump_part_info "$DISK"
     fi
   ;;
-  -l|list)
-    if [[ $# -lt 2 ]]; then
-      print_w "List option need an argument."
-      print "Example: ${0##*/} list /dev/sda"
+  list)
+    if [[ -z ${DISK:-} ]]; then
+      print_w "List option need an argument"
+      print "Example: ${0##*/} -t list -i /dev/sda"
       exit
     fi
 
-    dump_part_info "$2" &>/dev/null
+    dump_part_info "$DISK" &>/dev/null
+
+    if [[ ${#SECTOR[@]} -eq 0 ]]; then
+      print_w "$DISK doesn't have partition table"
+      exit
+    fi
 
     # Print table header.
     printf  "\e[01;32m %-10s %-14s %-14s %12s %10s\n\e[m" \
@@ -183,46 +257,69 @@ case $1 in
             'SIZE (dec)' \
             'SIZE (MB)'
 
-    n=1
-    while read -r PSTART PEND; do
+    for (( NUM=${#SECTOR[@]}, i=0; i<NUM; i++ )); do
+      PSTART="${SECTOR[i]}"
+      PSTART="${PSTART%% *}"
+      PEND="${SECTOR[i]}"
+      PEND="${PEND##* }"
       LBAStart=$(printf '%x' "$((PSTART))")
       # Print table content.
       printf  " %-10s 0x%-12s 0x%-12x %12d %10d\n" \
-              "$n. ${XPART[$n]}" \
+              "$((i+1)). ${XPART[$i]}" \
               "$LBAStart" \
               "$((PEND))" \
               "$((PEND))" \
               "$(((PEND) / 0x100000))"
-      ((n++))
-    # Get active partitions and multiply it by 512.
-    done < <(od -t x4 "$PARTINFO" | awk '/80000000/{ print "0x"$3"*0x200 0x"$4"*0x200" }')
+    done
   ;;
-  -m|mount)
-    if [[ "$#" -eq 4 ]]; then
-      if [[ ! -d $3 ]]; then
-        print_w "${3}: No such directory."
-        exit
+  mount)
+    DRV="${DRV:-c}"
+
+    if [[ -z $DISK ]]; then
+      print_w "Please specify disk to mount"
+      exit
+    fi
+
+    if [[ -z ${MNT:-} ]]; then
+      if lsblk -dno MODEL "$DISK" &>/dev/null; then
+        MNT="$(lsblk -dno MODEL "$DISK")"
+        MNT="${HOME}/XBMount/${MNT// /-}_${DRV}"
+      else
+        MNT="${HOME}/XBMount/${DISK##*/}_${DRV}"
       fi
-      # Slice the drive letter string.
-      DRVLTR=${4:(-1)}
-      # And make it lowercase.
-      case ${DRVLTR,,} in
-        c|e|f|g|x|y|z)
-          mount_partition "$2" "$3" "${XPART[$DRVLTR]}"
+      mkdir -p "$MNT"
+    fi
+
+    if [[ ${DISK##*.} == 'qcow2' ]]; then
+      print_w 'This will unmounting mounted partition of this disk'
+      read -rp "Proceed (y/N)? " answer
+      case "$answer" in
+        y|Y )
+          # continue
         ;;
-        *)
-          print_w 'Mount option only accept C, E, F, G, X, Y and Z drive.'
+        * )
           exit
         ;;
       esac
-    elif [[ "$#" -eq 3 ]]; then
-      # Mount C if no drive letter specified (default behaviour).
-      sudo fatxfs -o allow_other "${@:2}"
-    elif [[ "$#" -lt 3 ]]; then
-      print_w "Mount option need arguments."
-      print "Example: ${0##*/} mount /dev/sda /mnt/point --drive=f"
+      reconnect_qcow "$DISK"
+    fi
+
+    if [[ ! -d $MNT ]]; then
+      print_w "${MNT}: mount point does not exist."
       exit
     fi
+
+
+    case "$DRV" in
+      c|e|f|g|x|y|z)
+        mount_partition "$DISK" "$MNT" "${XPART[$DRV]}"
+      ;;
+      *)
+        print_w 'Mount option only accept C, E, F, G, X, Y and Z drive'
+        exit
+      ;;
+    esac
+    nemo --tabs --existing-window "$MNT"
   ;;
   *)
     print_usage
