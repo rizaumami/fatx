@@ -40,21 +40,21 @@ set -euo pipefail
 # ------------------------------------------------------------------------------
 
 print() { printf ':: %s\n' "$@" ;}
-# Print green print,
+# Green text.
 print_g() { printf '\e[32m:: %s\n\e[m' "$@" ;}
-# Print brown print.
+# Brown text.
 print_w() { printf '\e[33m:: %s\n\e[m' "$@" ;}
 
 # Checking dependencies:
-declare -a DEPS=( awk fatxfs od )
+declare -a DEPS=( fatxfs lsblk od )
 for (( NUM=${#DEPS[@]}, i=0; i<NUM; i++ )); do
   if command -v "${DEPS[i]}" &>/dev/null ; then
     unset -v 'DEPS[i]'
   fi
 done
 if [[ "${#DEPS[@]}" -gt 0 ]]; then
-  print_w    'Package(s) not found'
-  print_w    'Install the proper distribution package for your system:'
+  print_w 'Package(s) not found'
+  print_w 'Install the proper distribution package for your system:'
   printf  '   - %s\n' "${DEPS[@]}"
   exit 1
 fi
@@ -69,36 +69,55 @@ PARTINFO='/tmp/ogxptbl'
 # 3. X       0x80000        0x2ee00000        786432000        750
 # 4. Y       0x2ee80000     0x2ee00000        786432000        750
 # 5. Z       0x5dc80000     0x2ee00000        786432000        750
-declare -a RETAIL=(
-'0x0055f400*0x200 0x009896b0*0x200'
-'0x00465400*0x200 0x000fa000*0x200'
-'0x00000400*0x200 0x00177000*0x200'
-'0x00177400*0x200 0x00177000*0x200'
-'0x002ee400*0x200 0x00177000*0x200'
-)
 
 declare -A XPART=( [0]="E" [1]="C" [2]="X" [3]="Y" [4]="Z" [5]="F" [6]="G" [e]="0" [c]="1" [x]="2" [y]="3" [z]="4" [f]="5" [g]="6" )
 
 # FUNCTIONS --------------------------------------------------------------------
 
-reconnect_qcow(){
-  # This is dirty. I don't know how to mount multi partition of qcow2.
-  # So we forced probe > unmount > disconnect > reconnect.
-  sudo modprobe nbd max_part=8 &>/dev/null
-  if grep "${1##*/}" /etc/mtab &>/dev/null; then
-    MNTQCOW=$(grep -oP '(?<=fatxfs ).*?(?= fuse.fatxfs)' /etc/mtab | grep "${1##*/}")
-    sudo umount -l "$MNTQCOW"
+# Automatically switch to root if failed as regular user.
+as_sudo() {
+  if [[ $(stat -c '%U' "$DISK") == "$USER" ]]; then
+    "$@"
+  else
+    sudo "$@"
   fi
-  sudo qemu-nbd --disconnect /dev/nbd0 &>/dev/null
-  sudo qemu-nbd --connect=/dev/nbd0 "$1"
-  DISK='/dev/nbd0'
+}
+
+check_disk() {
+  if [[ -z ${DISK:-} ]]; then
+    print_w "No disk to $TASK"
+    print "Example: ${0##*/} $TASK -i /dev/sda"
+    exit
+  fi
 }
 
 dump_part_info() {
+  local MNTQCOW=''
+  local MODEL=''
   DISK="$1"
 
   if [[ ${DISK##*.} == 'qcow2' ]]; then
-    reconnect_qcow "$1"
+    # Unmount mounted the disk partition, because:
+    # 1. dd: error reading '/dev/nbd0'
+    # 2. I don't know how to mount multi partition of a same qcow (nbd).
+    while read -r _ mnt _; do
+      if [[ $mnt =~ ${DISK##*/} ]]; then
+        MNTQCOW="${mnt//\\040/ }"
+      fi
+    done < /etc/mtab
+    if [[ $TASK != 'list' ]] && [[ -n $MNTQCOW ]]; then
+      print_w "Found a mounted partition of $DISK"
+      read -rp ':: Unmount (y/N)? ' answer
+      [[ ${answer,,} != 'y' ]] && exit
+      sudo umount -l "$MNTQCOW"
+    fi
+
+    if [[ $DISK != '/dev/nbd0' ]]; then
+      sudo modprobe nbd max_part=8 &>/dev/null
+      sudo qemu-nbd --disconnect /dev/nbd0 &>/dev/null
+      sudo qemu-nbd --connect=/dev/nbd0 "$DISK"
+      DISK='/dev/nbd0'
+    fi
   fi
 
   if lsblk -dno MODEL "$DISK" &>/dev/null; then
@@ -110,31 +129,31 @@ dump_part_info() {
   fi
 
   PARTINFO="${PARTINFO}-${MODEL// /_}"
-  if [[ $(stat -c '%U' "$DISK") == "$USER" ]]; then
-    dd if="$DISK" of="$PARTINFO" bs=512 count=1 status=none
-  else
-    sudo dd if="$DISK" of="$PARTINFO" bs=512 count=1 status=none
-  fi
+  as_sudo dd if="$DISK" of="$PARTINFO" bs=512 count=1 status=none
 
-  if [[ ${DISK##*.} == 'qcow2' ]]; then
-    sudo qemu-nbd --disconnect /dev/nbd0 &>/dev/null
-  fi
-
-  # Get active partitions and multiply it by 512.
-  mapfile -t SECTOR < <(od -t x4 "$PARTINFO" | awk '/80000000/{ print "0x"$3"*0x200 0x"$4"*0x200" }')
-
-  print_g "$DISK partition info has been dumped to ${PARTINFO}"
+  SECTOR=()
+  while read -r _ active start size _; do
+    # Get active partitions.
+    if [[ $active == '80000000' ]]; then
+      # MUltiply by 512.
+      SECTOR+=("$((0x${start}*0x200)) $((0x${size}*0x200))")
+    fi
+  done < <(od -t x4 "$PARTINFO")
 }
 
 mount_partition() {
-  local LBASize LBAStart SECTOR
-
-  dump_part_info "$1" &>/dev/null
+  dump_part_info "$1"
 
   if [[ ${#SECTOR[@]} -eq 0 ]]; then
     print_w "$1 doesn't have partition table"
-    print "> Trying retail offset and size"
-    SECTOR=( "${RETAIL[@]}" )
+    print "> Trying retail (plus F) offset and size"
+    SECTOR=(
+      '0xabe80000 0x1312d6000'
+      '0x8ca80000 0x1f400000'
+      '0x80000 0x2ee00000'
+      '0x2ee80000 0x2ee00000'
+      '0x5dc80000 0x2ee00000'
+    )
   fi
 
   if [[ $3 -ge ${#SECTOR[@]} ]]; then
@@ -142,17 +161,16 @@ mount_partition() {
     exit
   fi
 
-  LBAStart=$(printf '0x%x' "$((${SECTOR[$3]::16}))")
-  LBASize=$(printf '0x%x' "$((${SECTOR[$3]:(-16)}))")
+  as_sudo fatxfs -o allow_other "$DISK" "$2" --offset="$(printf '0x%x' "${SECTOR[$3]% *}")" --size="$(printf '0x%x' "${SECTOR[$3]##* }")"
 
-  sudo fatxfs -o allow_other "$1" "$2" --offset="${LBAStart}" --size="${LBASize}"
+  nemo --tabs --existing-window "$MNT"
 }
 
 print_usage() {
   printf '%s\n' "
   ${0##*/} is a wrapper script for fatxfs, a userspace FATX filesystem driver.
 
-  Usage: ${0##*/} -t TASK OPTIONS
+  Usage: ${0##*/} TASK OPTIONS
 
   TASK:
     lsblk   List unmounted block device (connected disks).
@@ -169,28 +187,28 @@ print_usage() {
 
   Example:
     - List connected but unmounted block devices.
-      ${0##*/} -t lsblk
+      ${0##*/} lsblk
 
     - Dump partition info of /dev/sdc.
-      ${0##*/} -t dump -i /dev/sdc
+      ${0##*/} dump -i /dev/sdc
 
     - List partitions of /dev/sda.
-      ${0##*/} -t list -i /dev/sda
+      ${0##*/} list -i /dev/sda
 
     - Mount F partition of /dev/sdc to ${HOME}/ogxhdd.
-      ${0##*/} -t mount -o /dev/sdc -o ${HOME}/ogxhdd -d F
+      ${0##*/} mount -o /dev/sdc -o ${HOME}/ogxhdd -d F
 "
   exit
 }
 # MAIN -------------------------------------------------------------------------
 
-# Cleanup after an unexpected event.
-#trap 'rm -r "$TMPDIR"; exit' SIGINT ERR
-
 # If this script run without argument.
 [[ ${#@} -eq 0 ]] && print_usage
 
-while getopts ":d:hi:o:t:v" opt; do
+TASK="$1"
+
+shift 1
+while getopts ":d:hi:o:v" opt; do
   case $opt in
     d)
       DRV="${OPTARG,,}"
@@ -204,11 +222,8 @@ while getopts ":d:hi:o:t:v" opt; do
     o)
       MNT="$OPTARG"
     ;;
-    t)
-      TASK="$OPTARG"
-    ;;
     v)
-      echo ':: fatx-cli v0.3 (2024.01.04) - written by si_kabayan'
+      echo ':: fatx-cli v0.4 (2024.01.06) - written by si_kabayan'
       exit
     ;;
     \?)
@@ -227,22 +242,13 @@ case "$TASK" in
     lsblk -Ado PATH,SIZE,MODEL
   ;;
   dump)
-    if [[ -z ${DISK:-} ]]; then
-      print_w 'Please define which disk to dump'
-      print "Example: ${0##*/} -t dump -i /dev/sda"
-      exit
-    else
-      dump_part_info "$DISK"
-    fi
+    check_disk
+    dump_part_info "$DISK"
+    print_g "$DISK partition info has been dumped to ${PARTINFO}"
   ;;
   list)
-    if [[ -z ${DISK:-} ]]; then
-      print_w "List option need an argument"
-      print "Example: ${0##*/} -t list -i /dev/sda"
-      exit
-    fi
-
-    dump_part_info "$DISK" &>/dev/null
+    check_disk
+    dump_part_info "$DISK" #&>/dev/null
 
     if [[ ${#SECTOR[@]} -eq 0 ]]; then
       print_w "$DISK doesn't have partition table"
@@ -257,61 +263,39 @@ case "$TASK" in
             'SIZE (dec)' \
             'SIZE (MB)'
 
+    # Print table content.
     for (( NUM=${#SECTOR[@]}, i=0; i<NUM; i++ )); do
-      PSTART="${SECTOR[i]}"
-      PSTART="${PSTART%% *}"
-      PEND="${SECTOR[i]}"
-      PEND="${PEND##* }"
-      LBAStart=$(printf '%x' "$((PSTART))")
-      # Print table content.
+      PEND="${SECTOR[i]##* }"
       printf  " %-10s 0x%-12s 0x%-12x %12d %10d\n" \
               "$((i+1)). ${XPART[$i]}" \
-              "$LBAStart" \
+              "$(printf '%x' "$((${SECTOR[i]% *}))")" \
               "$((PEND))" \
               "$((PEND))" \
               "$(((PEND) / 0x100000))"
     done
   ;;
   mount)
+    check_disk
+
     DRV="${DRV:-c}"
-
-    if [[ -z $DISK ]]; then
-      print_w "Please specify disk to mount"
-      exit
-    fi
-
-    if [[ -z ${MNT:-} ]]; then
-      if lsblk -dno MODEL "$DISK" &>/dev/null; then
-        MNT="$(lsblk -dno MODEL "$DISK")"
-        MNT="${HOME}/XBMount/${MNT// /-}_${DRV}"
-      else
-        MNT="${HOME}/XBMount/${DISK##*/}_${DRV}"
-      fi
-      mkdir -p "$MNT"
-    fi
-
-    if [[ ${DISK##*.} == 'qcow2' ]]; then
-      print_w 'This will unmounting mounted partition of this disk'
-      read -rp "Proceed (y/N)? " answer
-      case "$answer" in
-        y|Y )
-          # continue
-        ;;
-        * )
-          exit
-        ;;
-      esac
-      reconnect_qcow "$DISK"
-    fi
-
-    if [[ ! -d $MNT ]]; then
-      print_w "${MNT}: mount point does not exist."
-      exit
-    fi
-
 
     case "$DRV" in
       c|e|f|g|x|y|z)
+        if [[ -z ${MNT:-} ]]; then
+          if lsblk -dno MODEL "$DISK" &>/dev/null; then
+            MNT="$(lsblk -dno MODEL "$DISK")"
+            MNT="${HOME}/XBMount/${MNT// /-} - ${DRV^^}"
+          else
+            MNT="${HOME}/XBMount/${DISK##*/} - ${DRV^^}"
+          fi
+          mkdir -p "$MNT"
+        fi
+
+        if [[ ! -d $MNT ]]; then
+          print_w "${MNT}: mount point does not exist."
+          exit
+        fi
+
         mount_partition "$DISK" "$MNT" "${XPART[$DRV]}"
       ;;
       *)
@@ -319,7 +303,6 @@ case "$TASK" in
         exit
       ;;
     esac
-    nemo --tabs --existing-window "$MNT"
   ;;
   *)
     print_usage
